@@ -236,6 +236,10 @@ type VaultAuth struct {
 	// token stored in the named Secret resource to the Vault server.
 	// +optional
 	Kubernetes *VaultKubernetesAuth `json:"kubernetes,omitempty"`
+
+	// GCP authenticates with Vault by with Vault using the GCP auth mechanism.
+	// +optional
+	GCP *VaultGCPAuth `json:"gcp,omitempty"`
 }
 
 // VaultAppRole authenticates with Vault using the App Role auth mechanism,
@@ -284,6 +288,27 @@ type VaultKubernetesAuth struct {
 	// A required field containing the Vault Role to assume. A Role binds a
 	// Kubernetes ServiceAccount with a set of Vault policies.
 	Role string `json:"role"`
+}
+
+// Authenticate against Vault using the GCP authentication algorithm
+type VaultGCPAuth struct {
+	// Path where the GCP authentication backend is mounted in Vault, e.g:
+	// "gcp"
+	Path string `json:"path"`
+
+	// A required field containing the Vault Role to assume.
+	Role string `json:"role"`
+
+	// The type of GCP authentication, must be one of `gce` or `iam`.
+	// +kubebuilder:validation:Enum=gce;iam
+	Type string `json:"type"`
+
+	// Reference to a key in a Secret that contains the IAM service account key in
+	// JSON format used to authenticate with Vault.
+	// The `key` field must be specified and denotes which entry within the Secret
+	// resource is used as the GCP IAM service account key secret.
+	// +optional
+	ServiceAccountSecretRef cmmeta.SecretKeySelector `json:"serviceAccountSecretRef,omitempty"`
 }
 
 // ServiceAccountRef is a service account used by cert-manager to request a

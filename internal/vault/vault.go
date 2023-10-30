@@ -19,6 +19,7 @@ package vault
 import (
 	"context"
 	"crypto/x509"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -27,8 +28,13 @@ import (
 	"strings"
 	"time"
 
+	gcpmetadata "cloud.google.com/go/compute/metadata"
+	gcpcredentials "cloud.google.com/go/iam/credentials/apiv1"
+	gcpcredentialspb "cloud.google.com/go/iam/credentials/apiv1/credentialspb"
 	vault "github.com/hashicorp/vault/api"
 	"github.com/hashicorp/vault/sdk/helper/certutil"
+	"golang.org/x/oauth2/google"
+	"google.golang.org/api/option"
 	authv1 "k8s.io/api/authentication/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/utils/ptr"
@@ -218,6 +224,16 @@ func (v *Vault) setToken(client Client) error {
 		return nil
 	}
 
+	gcpAuth := v.issuer.GetSpec().Vault.Auth.GCP
+	if gcpAuth != nil {
+		token, err := v.requestTokenWithGCPAuth(client, gcpAuth)
+		if err != nil {
+			return fmt.Errorf("while requesting a Vault token using the GCP auth: %w", err)
+		}
+		client.SetToken(token)
+		return nil
+	}
+
 	return fmt.Errorf("error initializing Vault client: tokenSecretRef, appRoleSecretRef, or Kubernetes auth role not set")
 }
 
@@ -324,6 +340,40 @@ func (v *Vault) appRoleRef(appRole *v1.VaultAppRole) (roleId, secretId string, e
 	secretId = strings.TrimSpace(secretId)
 
 	return roleId, secretId, nil
+}
+
+func (v *Vault) gcpAuthServiceAccountRef(gcpAuth *v1.VaultGCPAuth) (*google.Credentials, string, error) {
+	ctx := context.Background()
+
+	name := gcpAuth.ServiceAccountSecretRef.Name
+	key := gcpAuth.ServiceAccountSecretRef.Key
+
+	secret, err := v.secretsLister.Secrets(v.namespace).Get(name)
+	if err != nil {
+		return nil, "", err
+	}
+
+	keyBytes, ok := secret.Data[key]
+	if !ok {
+		return nil, "", fmt.Errorf("no data for %q in secret '%s/%s'", key, v.namespace, name)
+	}
+
+	// Validate IAM service account JSON key format
+	credentials, err := google.CredentialsFromJSON(ctx, keyBytes)
+	if err != nil {
+		return nil, "", fmt.Errorf("failed parsing %q in secret '%s/%s' as IAM service account JSON key: %w", key, v.namespace, name, err)
+	}
+
+	// Fetch IAM service account email from the JSON instead of manually setting it configuration
+	var email struct {
+		Email string `json:"client_email"`
+	}
+	json.Unmarshal(credentials.JSON, &email)
+	if email.Email == "" {
+		return nil, "", fmt.Errorf("failed getting IAM service account email for %q in secret '%s/%s': %w", key, v.namespace, name, err)
+	}
+
+	return credentials, email.Email, nil
 }
 
 func (v *Vault) requestTokenWithAppRoleRef(client Client, appRole *v1.VaultAppRole) (string, error) {
@@ -459,6 +509,99 @@ func (v *Vault) requestTokenWithKubernetesAuth(client Client, kubernetesAuth *v1
 	token, err := vaultResult.TokenID()
 	if err != nil {
 		return "", fmt.Errorf("unable to read token: %s", err.Error())
+	}
+
+	return token, nil
+}
+
+func (v *Vault) requestTokenWithGCPAuth(client Client, gcpAuth *v1.VaultGCPAuth) (string, error) {
+	ctx := context.Background()
+
+	var gcpClient *gcpcredentials.IamCredentialsClient
+	var email string
+	var err error
+
+	switch {
+	case gcpAuth.Type == "gce":
+		if !gcpmetadata.OnGCE() {
+			return "", fmt.Errorf("GCE metadata service not available")
+		}
+
+		// Get default GCE instance service account email
+		email, err = gcpmetadata.Email("default")
+		if err != nil {
+			return "", fmt.Errorf("failed identifying default GCE service account email: %w", err)
+		}
+
+		gcpClient, err = gcpcredentials.NewIamCredentialsClient(ctx)
+
+	case gcpAuth.Type == "iam":
+		var credentials *google.Credentials
+
+		// Get IAM service account email from the JSON credentials file
+		credentials, email, err = v.gcpAuthServiceAccountRef(gcpAuth)
+		if err != nil {
+			return "", err
+		}
+
+		gcpClient, err = gcpcredentials.NewIamCredentialsClient(ctx, option.WithCredentials(credentials))
+	}
+
+	if err != nil {
+		return "", fmt.Errorf("unable to initialize GCP client: %w", err)
+	}
+
+	defer gcpClient.Close()
+
+	// Use OpenID Connect token issued by Google as a signed JWT for Vault authentication
+	gcpReq := &gcpcredentialspb.GenerateIdTokenRequest{
+		Name:         "projects/-/serviceAccounts/" + email,
+		Audience:     "vault/" + gcpAuth.Role,
+		IncludeEmail: true,
+	}
+	gcpResp, err := gcpClient.GenerateIdToken(ctx, gcpReq)
+	if err != nil {
+		return "", fmt.Errorf("unable to generate OIDC token: %w", err)
+	}
+
+	parameters := map[string]string{
+		"role": gcpAuth.Role,
+		"jwt":  gcpResp.Token,
+	}
+
+	authPath := gcpAuth.Path
+	if authPath == "" {
+		authPath = "gcp"
+	}
+
+	url := path.Join("/v1", "auth", authPath, "login")
+
+	request := client.NewRequest("POST", url)
+
+	err = request.SetJSONBody(parameters)
+	if err != nil {
+		return "", fmt.Errorf("error encoding Vault parameters: %s", err.Error())
+	}
+
+	resp, err := client.RawRequest(request)
+	if err != nil {
+		return "", fmt.Errorf("error logging in to Vault server: %s", err.Error())
+	}
+
+	defer resp.Body.Close()
+
+	vaultResult := vault.Secret{}
+	if err := resp.DecodeJSON(&vaultResult); err != nil {
+		return "", fmt.Errorf("unable to decode JSON payload: %s", err.Error())
+	}
+
+	token, err := vaultResult.TokenID()
+	if err != nil {
+		return "", fmt.Errorf("unable to read token: %s", err.Error())
+	}
+
+	if token == "" {
+		return "", errors.New("no token returned")
 	}
 
 	return token, nil
